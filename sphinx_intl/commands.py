@@ -24,9 +24,26 @@ else:
 
 import polib
 
+import itertools
+from utils import expand_tree, ProcessPool
+
 
 ENVKEY_PREFIX = 'SPHINXINTL_'
 FS_ENCODING = sys.getfilesystemencoding() or sys.getdefaultencoding()
+
+
+try:
+    import txclib.utils
+    import txclib.comamnds
+except ImportError:
+    msg = textwrap.dedent("""\
+        Could not import 'txclib'.
+        You need install transifex_client external library.
+        Please install below command if you want to this action:
+
+            $ pip install sphinx-intl[transifex]
+        """)
+    raise RuntimeError(msg)
 
 
 ####################################
@@ -219,7 +236,6 @@ def get_tx_root():
         raise RuntimeError(msg)
     return tx_root
 
-
 @command
 def update(locale_dir, pot_dir=None, language=(), out=sys.stdout):
     """
@@ -248,40 +264,38 @@ def update(locale_dir, pot_dir=None, language=(), out=sys.stdout):
                % locals())
         raise RuntimeError(msg)
 
-    for dirpath, dirnames, filenames in os.walk(pot_dir):
-        for filename in filenames:
-            pot_file = os.path.join(dirpath, filename)
-            base, ext = os.path.splitext(pot_file)
-            if ext != ".pot":
-                continue
-            basename = relpath(base, pot_dir)
-            for lang in language:
-                po_dir = os.path.join(locale_dir, lang, 'LC_MESSAGES')
-                po_file = os.path.join(po_dir, basename + ".po")
-                outdir = os.path.dirname(po_file)
-                if not os.path.exists(outdir):
-                    os.makedirs(outdir)
+    for pot_file in expand_tree(path=pot_dir, extension='pot'):
+        pot_file = os.path.join(dirpath, filename)
+        base, ext = os.path.splitext(pot_file)
+        basename = relpath(base, pot_dir)
 
-                pot = polib.pofile(pot_file)
-                if os.path.exists(po_file):
-                    po = polib.pofile(po_file)
-                    msgids = set([str(m) for m in po])
-                    po.merge(pot)
-                    new_msgids = set([str(m) for m in po])
-                    if msgids != new_msgids:
-                        added = new_msgids - msgids
-                        deleted = msgids - new_msgids
-                        print_('Update:', po_file, "+%d, -%d" % (
-                            len(added), len(deleted)), file=out)
-                        po.save(po_file)
-                    else:
-                        print_('Not Changed:', po_file, file=out)
-                else:
-                    po = polib.POFile()
-                    po.metadata = pot.metadata
-                    print_('Create:', po_file, file=out)
-                    po.merge(pot)
+        for lang in language:
+            po_dir = os.path.join(locale_dir, lang, 'LC_MESSAGES')
+            po_file = os.path.join(po_dir, basename + ".po")
+            outdir = os.path.dirname(po_file)
+            if not os.path.exists(outdir):
+                os.makedirs(outdir)
+
+            pot = polib.pofile(pot_file)
+            if os.path.exists(po_file):
+                po = polib.pofile(po_file)
+                msgids = set([str(m) for m in po])
+                po.merge(pot)
+                new_msgids = set([str(m) for m in po])
+                if msgids != new_msgids:
+                    added = new_msgids - msgids
+                    deleted = msgids - new_msgids
+                    print_('Update:', po_file, "+%d, -%d" % (
+                        len(added), len(deleted)), file=out)
                     po.save(po_file)
+                else:
+                    print_('Not Changed:', po_file, file=out)
+            else:
+                po = polib.POFile()
+                po.metadata = pot.metadata
+                print_('Create:', po_file, file=out)
+                po.merge(pot)
+                po.save(po_file)
 
 
 @command
@@ -298,18 +312,14 @@ def build(locale_dir, language=(), out=sys.stdout):
         language = get_lang_dirs(locale_dir)
     for lang in language:
         lang_dir = os.path.join(locale_dir, lang)
-        for dirpath, dirnames, filenames in os.walk(lang_dir):
-            for filename in filenames:
-                po_file = os.path.join(dirpath, filename)
-                base, ext = os.path.splitext(po_file)
-                if ext != ".po":
-                    continue
 
-                mo_file = base + ".mo"
-                print_('Build:', mo_file, file=out)
-                po = polib.pofile(po_file)
-                po.save_as_mofile(fpath=mo_file)
+        for po_file in expand_tree(path=lang_dir, extension='po'):
+            po_file = os.path.join(dirpath, filename)
+            mo_file = po_file[:-2] + 'mo'
 
+            print_('Build:', mo_file, file=out)
+            po = polib.pofile(po_file)
+            po.save_as_mofile(fpath=mo_file)
 
 @command
 def stat(locale_dir, language=(), out=sys.stdout):
@@ -325,23 +335,19 @@ def stat(locale_dir, language=(), out=sys.stdout):
         language = get_lang_dirs(locale_dir)
     for lang in language:
         lang_dir = os.path.join(locale_dir, lang)
-        for dirpath, dirnames, filenames in os.walk(lang_dir):
-            for filename in filenames:
-                po_file = os.path.join(dirpath, filename)
-                base, ext = os.path.splitext(po_file)
-                if ext != ".po":
-                    continue
 
-                po = polib.pofile(po_file)
-                print_(po_file, ':',
-                       ("%d translated, "
-                        "%d fuzzy, "
-                        "%d untranslated." % (
-                            len(po.translated_entries()),
-                            len(po.fuzzy_entries()),
-                            len(po.untranslated_entries()),
-                        )),
-                       file=out)
+
+        for po_file in expand_tree(path=lang_dir, extension='po'):
+            po = polib.pofile(po_file)
+            print_(po_file, ':',
+                   ("%d translated, "
+                    "%d fuzzy, "
+                    "%d untranslated." % (
+                        len(po.translated_entries()),
+                        len(po.fuzzy_entries()),
+                        len(po.untranslated_entries()),
+                    )),
+                   file=out)
 
 
 @command
@@ -420,46 +426,54 @@ def update_txconfig_resources(transifex_project_name, locale_dir,
     :param out: file like object for displaying information.
     :return: None
     """
-    try:
-        import txclib.utils
-    except ImportError:
-        msg = textwrap.dedent("""\
-            Could not import 'txclib.utils'.
-            You need install transifex_client external library.
-            Please install below command if you want to this action:
-
-                $ pip install sphinx-intl[transifex]
-            """)
-        raise RuntimeError(msg)
+    if pot_dir is None:
+        pot_dir = os.path.join(locale_dir, 'pot')
 
     tx_root = get_tx_root()
-    args_tmpl = (
-        '--auto-local -r %(transifex_project_name)s.%(resource_name)s '
-        '%(locale_dir)s/<lang>/LC_MESSAGES/%(resource_path)s.po '
-        '--source-lang en '
-        '--source-file %(locale_dir)s/pot/%(resource_path)s.pot '
-        '--execute'
-    )
-    if not pot_dir:
-        pot_dir = os.path.join(locale_dir, 'pot')
-    for dirpath, dirnames, filenames in os.walk(pot_dir):
-        for filename in filenames:
-            pot_file = os.path.join(dirpath, filename)
-            base, ext = os.path.splitext(pot_file)
-            if ext != ".pot":
-                continue
-            resource_path = relpath(base, pot_dir)
-            pot = polib.pofile(pot_file)
-            if len(pot):
-                resource_name = re.sub(r'[\\/]', '--', resource_path)
-                resource_name = resource_name.replace('.', '_')
-                args = (args_tmpl % locals()).split()
-                txclib.utils.exec_command('set', args, tx_root)
-            else:
-                print_(pot_file, 'is empty, skipped', file=out)
+    args = {
+        'tmpl': (
+            '--auto-local -r %(transifex_project_name)s.%(resource_name)s '
+            '%(locale_dir)s/<lang>/LC_MESSAGES/%(resource_path)s.po '
+            '--source-lang en '
+            '--source-file %(locale_dir)s/pot/%(resource_path)s.pot '
+            '--execute'
+           ),
+        'transifex_project_name': transifex_project_name,
+        'locale_dir': locale_dir,
+        'pot_dir': pot_dir,
+        'tx_root': tx_root
+    }
 
-    txclib.utils.exec_command('set', ['-t', 'PO'], tx_root)
+    with ProcessPool() as p:
+        result = p.map_async(set_pot_for_tx,
+                             zip(expand_tree(path=pot_dir, extension='pot'), itertools.cycle([args])))
 
+        for r in result:
+            r.get()
+
+        p.apply_async(txclib.utils.exec_command, args=('set', ['-t', 'PO'], tx_root))
+
+    print_('uploaded %d .pot files to transifex.' % len(result))
+
+
+def set_pot_for_tx(args):
+    pot_file = args[0]
+    args = args[1]
+    pot_dir = args['pot_dir']
+
+    base, ext = os.path.splitext(pot_file)
+    args['resource_path'] = relpath(base, pot_dir)
+
+    pot = polib.pofile(pot_file)
+
+    if len(pot):
+        args['resource_name'] = re.sub(r'[\\/]', '--', args['resource_path']).replace('.', '_')
+        args_tmpl = (args['tmpl'] % args).split()
+        print_("seting pot file: %s" % pot_file)
+        txclib.commands.cmd_set('set ' + args_tmpl), args['tx_root'])
+        print_("set pot file: %s!!" % pot_file)
+    else:
+        print_(pot_file, 'is empty, skipped', file=out)
 
 def parse_option(argv):
     usage = textwrap.dedent("""
